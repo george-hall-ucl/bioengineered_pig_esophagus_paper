@@ -1,0 +1,1425 @@
+---
+title: "Spatial Transcriptomic Analyses of Bioengineered Porcine Oesophaus"
+author: "George T. Hall"
+date: "Compiled on `r format(Sys.time(), '%d %B %Y')`"
+output:
+    html_document:
+        toc: true
+        toc_depth: 2
+        toc_float:
+            collapsed: false
+        number_sections: true
+        code_folding: none
+        keep_md: true
+---
+
+# Preamble
+
+<details>
+<summary>`harmony` bugfix</summary>
+```{r harmony_bugfix}
+# This is a bugfix. For some reason, runnibng RunUMAP() is necessary before
+# running Harmony (otherwise all the embeddings are NaN). However, it's
+# not necessary to actually store / use the result. It turns out that
+# it's actually just the uwot function that needs to be run, but it is
+# unclear why (probably due to Rcpp or something?). For now, we run it here on
+# dummy data just to fix Harmony. Ideally, we wouldn't run this
+# function just to fix Harmony
+uwot:::uwot(matrix(1:40, nrow = 20))
+```
+</details>
+
+We set the random seed before proceeding.
+
+```{r set_seed}
+set.seed(123)
+```
+
+## Preliminary function definitions
+
+In this section, we define some functions that we will use throughout the rest
+of this notebook. Each definition is hidden by default.
+
+<details>
+<summary>`VolPlot` function</summary>
+```{r volplot_fcn}
+VolPlot <- function(marks, to_label) {
+    marks$gene <- rownames(marks)
+    marks$p_val_adj_neg_log <- -1 * log10(marks$p_val_adj)
+    y_upper_lim <- 330
+    inf_idxs <- is.infinite(marks$p_val_adj_neg_log)
+    marks$p_val_adj_neg_log[inf_idxs] <- y_upper_lim
+    marks$is_inf <- inf_idxs
+    pos_lfc_lower_lim <- 1
+    neg_lfc_upper_lim <- -1
+    sig_marks_pos <- subset(marks, avg_log2FC > pos_lfc_lower_lim)
+    sig_marks_neg <- subset(marks, avg_log2FC < neg_lfc_upper_lim)
+    max_abs_lfc <- max(abs(marks$avg_log2FC))
+
+    # Assign classes to genes based on how DE they are. Used to set colours
+    de_class <- ifelse(marks$avg_log2FC < neg_lfc_upper_lim & marks$p_val_adj < 0.01,
+                       "Downreg",
+                       ifelse(marks$avg_log2FC > pos_lfc_lower_lim & marks$p_val_adj < 0.01,
+                              "Upreg",
+                              ifelse(marks$p_val_adj < 0.01,
+                                     "Low-LFC", "Not-Sig")))
+    de_class <- factor(de_class, levels = c("Not-Sig", "Low-LFC",
+                                            "Downreg", "Upreg"))
+
+    genes_to_label <- subset(marks, gene %in% to_label)
+    points_alpha <- 0.5
+    plot <- ggplot(marks, aes(x = avg_log2FC, y = p_val_adj_neg_log,
+                              label = rownames(marks))) +
+            geom_point(aes(color = avg_log2FC),
+                       size = 2, stroke = NA) +
+            scale_color_viridis_c(option = "plasma", alpha = points_alpha) +
+            guides(color = guide_colorbar(bquote(Log["2"]~"fold change"))) +
+            geom_text_repel(data = genes_to_label, aes(label = gene),
+                            min.segment.length = 0, size = 4,
+                            force = 10, segment.alpha = 0.5,
+                            max.overlaps = 50, fontface = "bold", seed = 456) +
+            xlim(-max_abs_lfc, max_abs_lfc) +
+            ylim(-log10(0.01), min(y_upper_lim, max(marks$p_val_adj_neg_log))) +
+            xlab(bquote(Log["2"]~"fold change")) +
+            ylab(bquote(-Log["10"] ~ P)) +
+            theme(panel.grid.major = element_blank(),
+                  panel.grid.minor = element_blank(),
+                  panel.background = element_blank(),
+                  axis.line = element_line(color = "black")) +
+            coord_cartesian(clip = "off")
+
+    return(plot)
+}
+```
+</details>
+
+<details>
+<summary>`add_visual_reduction`</summary>
+```{r add_visual_reduction_fcn}
+add_visual_reduction <- function(cell_obj) {
+    old_default_assay <- DefaultAssay(cell_obj)
+    DefaultAssay(cell_obj) <- "Spatial"
+    visual_coords <- GetTissueCoordinates(cell_obj)
+    colnames(visual_coords) <- c("visual_1", "visual_2")
+    vis_coords_mat <- as.matrix(visual_coords)
+    cell_obj@reductions$visual <- CreateDimReducObject(key = "visual_",
+                                                       embeddings = vis_coords_mat,
+                                                       assay = "Spatial")
+    DefaultAssay(cell_obj) <- old_default_assay
+
+    return(cell_obj)
+}
+```
+</details>
+
+<details>
+<summary>`get_sample_name_from_plot`</summary>
+```{r get_sample_name_from_plot}
+# Work out the sample name based on the number of spots in the plot.
+get_sample_name_from_plot <- function(p) {
+    # prepend "x" so that don't start with number
+    sample_name <- switch(paste0("x", nrow(p$data)),
+           x2783 = "Native_1_ST",
+           x2519 = "Native_2_ST",
+           x2995 = "Native_3_ST",
+           x2974 = "Cher_native_V",
+           x2296 = "Fergie_Graft_V",
+           x2816 = "Cher_Graft_V",
+           x2147 = "Cher_ReCell_V",
+           x3704 = "Adele_Graft_V",
+           x2768 = "Beyonce_Graft_V",
+           x2458 = "Dolly_Graft_V",
+           x3452 = "Ella_Graft_V")
+
+    return(sample_name)
+}
+```
+</details>
+
+<details>
+<summary>`FixSpatialPlot`</summary>
+
+```{r FixSpatialPlot_fcn}
+FixSpatialPlot <- function(p, sample_name = NULL) {
+    if (is.null(sample_name)) {
+        sample_name <- get_sample_name_from_plot(p)
+        if (is.null(sample_name)) {
+            return(p)
+        }
+    }
+
+    point_size_factors <- list("Native_1_ST" = 1.5, "Native_2_ST" = 1.55,
+                               "Native_3_ST" = 1.6, "Cher_native_V" = 1.6,
+                               "Fergie_Graft_V" = 1.7, "Cher_Graft_V" = 1.6,
+                               "Cher_ReCell_V" = 1.7, "Adele_Graft_V" = 1.4,
+                               "Beyonce_Graft_V" = 1.45, "Dolly_Graft_V" = 1.6,
+                               "Ella_Graft_V" = 1.5)
+
+    p$layers[[1]]$aes_params$point.size.factor <- point_size_factors[[sample_name]]
+
+    return(p)
+}
+```
+</details>
+
+<details>
+<summary>`DotPlot_square`</summary>
+
+```{r DotPlot_square_fcn}
+DotPlot_square <- function(dot_plot, sig_degs) {
+    if (!is.null(sig_degs)) {
+        sig_degs <- sig_degs[sig_degs$features.plot %in% dot_plot$features.plot, ]
+        sig_degs$id <- as.factor(sig_degs$id)
+    }
+
+    l <- lapply(unique(dot_plot$features.plot),
+                                      function(x) {
+                                          max_idxs <- which.max(dot_plot[dot_plot$features.plot == x, "lfc"])
+                                          return(levels(dot_plot$id)[max_idxs])
+                                      })
+    max_clust_df <- data.frame(gene = unique(dot_plot$features.plot), max_clust_idx = unlist(l))
+    max_clust_df$max_clust_idx <- factor(max_clust_df$max_clust_idx, levels = levels(dot_plot$id))
+    max_clust_df$lfc <- apply(max_clust_df, 1,
+                              function(x) {
+                                  subset(dot_plot,
+                                         (id == x[2]) & (features.plot == x[1]))$lfc
+                              })
+    genes_ordered <- max_clust_df[with(max_clust_df, order(max_clust_idx, -lfc)), ]$gene
+    dot_plot$features.plot <- as.character(dot_plot$features.plot)
+    dot_plot$features.plot <- factor(dot_plot$features.plot, levels = genes_ordered)
+
+    min_max <- max(abs(dot_plot$lfc))
+
+    p <- ggplot(mapping = aes(x = id, y = features.plot)) +
+            geom_point(data = dot_plot, aes(color = lfc), shape = "square",
+                       size = 13)
+    if (!is.null(sig_degs)) {
+        p <- p + geom_point(data = sig_degs, color = "black", shape = "circle", size = 3) +
+                geom_point(data = sig_degs, color = "white", shape = "circle", size = 2)
+    }
+    p <- p + scale_colour_gradient2(high = "#82001E", low = "#003576",
+                                    name = bquote(Log["2"]~"fold change"),
+                                    limits = c(-min_max, min_max)) +
+            theme_bw() +
+            xlab("Cluster number") +
+            ylab("Gene")
+
+    return(p)
+}
+```
+</details>
+
+<details>
+<summary>`custom_FindMarkers`</summary>
+
+```{r custom_FindMarkers_fcn}
+custom_FindMarkers <- function(seu, grouping_col, md_colnames, idents_1,
+                               idents_2, latent_vars = NULL, pbulk_by = NULL) {
+    if (length(md_colnames) == 0) {
+        stop("md_colnames must be a vector of length > 1")
+    }
+
+    cells_1_barcodes <- colnames(seu[, seu@meta.data[, grouping_col] %in% idents_1])
+    cells_2_barcodes <- colnames(seu[, seu@meta.data[, grouping_col] %in% idents_2])
+    seu <- seu[, c(cells_1_barcodes, cells_2_barcodes)]
+
+    if (!is.null(pbulk_by)) {
+        df <- seu@meta.data[, c(pbulk_by, md_colnames)]
+        df <- aggregate(df[, -which(colnames(df) == pbulk_by)],
+                        list(df[, pbulk_by]), mean) %>%
+                t()
+        colnames(df) <- df[1, ]
+        df <- df[-1, ]
+        old_row_names <- rownames(df)
+        df <- apply(df, 2, as.numeric)
+        rownames(df) <- old_row_names
+
+        lv_list <- lapply(latent_vars, function(x) {
+                              tab <- table(seu[[pbulk_by]][, 1],
+                                           seu[[x]][, 1])
+                              apply(tab, 1, which.max) %>%
+                                as.numeric()
+                        })
+        lv_df <- as.data.frame(lv_list)
+        colnames(lv_df) <- latent_vars
+        rownames(lv_df) <- colnames(df)
+        cells_1_barcodes <- unique(seu[, cells_1_barcodes][[pbulk_by]][, 1])
+        cells_2_barcodes <- unique(seu[, cells_2_barcodes][[pbulk_by]][, 1])
+    } else {
+        df <- t(seu@meta.data[, md_colnames, drop = FALSE])
+        lv_df <- seu@meta.data[, latent_vars, drop = FALSE]
+    }
+
+    marks <- Seurat:::LRDETest(data.use = df, cells.1 = cells_1_barcodes,
+                               cells.2 = cells_2_barcodes, latent.vars = lv_df)
+    marks$p_val_adj <- sapply(marks$p_val,
+                              function(x) {
+                                  min(x * nrow(marks), 1)
+                              })
+    marks$gene <- rownames(marks)
+
+    return(marks)
+}
+```
+</details>
+
+<details>
+<summary>`change_color_scale`</summary>
+```{r fcn_change_color_scale}
+change_color_scale <- function(plot_list, gene_name) {
+    all_data <- lapply(plot_list,
+                       function(x) {
+                           x$data[, gene_name]
+                       }) %>%
+        unlist()
+    lims <- c(min(all_data), max(all_data))
+    plot_list <- lapply(plot_list,
+                        function(x) {
+                            x + scale_fill_viridis_c(option = "plasma",
+                                                     limits = lims)
+                        })
+
+    return(plot_list)
+}
+```
+</details>
+
+<details>
+<summary>`run_fgsea`</summary>
+```{r fcn_run_fgsea}
+run_fgsea <- function(in_marks, gene_sets)  {
+    ranks <- in_marks %>%
+             arrange(desc(avg_log2FC)) %>%
+             dplyr::select(gene, avg_log2FC) %>%
+             tibble::deframe()
+
+    set.seed(123)
+    fgsea_res <- fgsea(gene_sets, stats = ranks) %>%
+                    as_tibble() %>%
+                    arrange(desc(NES))
+    fgsea_res$is_signif <- fgsea_res$padj <= 0.05
+
+    return(fgsea_res)
+}
+```
+<details>
+
+
+## Load libraries
+
+Load the R libraries required in the analysis. Also set some options for the
+generation of this document.
+
+```{r load_libraries, results = 'hide', message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(results = 'hide', message = FALSE, warning = FALSE,
+                      error = FALSE, fig.align = "center", out.width = "75%")
+# compilation_level controls whether some chunks are not evaluated to save
+# time. Note that chunks may be skipped with eval = FALSE for other reasons
+# outside of compilation_level = 1.
+# compilation_level = 0: Skip time-consuming chunks
+# compilation_level = 1: Do not skip chunks
+compilation_level <- 1
+
+library(dplyr)
+library(Seurat)
+library(SeuratDisk)
+library(sctransform)
+library(harmony)
+library(patchwork)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(plotly)
+library(openxlsx)
+library(DESeq2)
+library(BiocParallel)
+library(msigdbr)
+library(fgsea)
+library(entropy)
+library(clustree)
+library(SCINA)
+library(SingleCellExperiment)
+library(DAseq)
+```
+
+## Other preamble
+
+Miscellaneous stuff that needs to happen before the rest of the code, e.g.
+renaming genes from the pig reference to human names.
+
+```{r preamble, results = "hide"}
+cells <- list()
+
+s_genes <- cc.genes$s.genes
+g2m_genes <- cc.genes$g2m.genes
+
+hcop_db <- read.csv(file = "data/human_pig_hcop_fifteen_column.tsv",
+                    sep = "\t")
+
+new_gene_name <- function(old_gene_name, hcop_db) {
+    if (substr(old_gene_name, 1, 7) != "ENSSSCG") {
+        return(old_gene_name)
+    }
+
+    idx <- match(old_gene_name, hcop_db$pig_ensembl_gene)
+
+    if (is.na(idx)) {
+        # Not in HCOP list
+        return (old_gene_name)
+    }
+
+    row <- hcop_db[idx, ]
+    pig_symb <- row$pig_symbol
+    human_symb <- row$human_symbol
+
+    if (substr(pig_symb, 1, 3) == "LOC" & human_symb != "-") {
+        new_name <- paste0("hl_", human_symb)
+    } else if (pig_symb != "-") {
+        new_name <- paste0("p_", pig_symb)
+    } else if (human_symb != "-") {
+        new_name <- paste0("h_", human_symb)
+    } else {
+        return(old_gene_name)
+    }
+
+    return(paste0(old_gene_name, " (", new_name, ")"))
+}
+```
+
+# Single-nucleus data
+
+## Load data
+
+Load the datasets from file.
+
+```{r load_sn_data}
+for (s in c("P1", "P2_R", "P3")) {
+    dir_name <- paste0("data/", s, "/filtered_feature_bc_matrix")
+    mat <- Read10X(dir_name)
+    cells[[s]] <- CreateSeuratObject(mat)
+    cells[[s]]$sample_multiplex <- s
+
+    vireo_no_geno_out_path <- paste0("data/", s, "/donor_ids.tsv")
+    vireo_no_geno_out <- read.csv(vireo_no_geno_out_path, sep = "\t")
+
+    vireo_with_geno_out_path <- paste0("data/", s, "/donor_ids_with_geno.tsv")
+    vireo_with_geno_out <- read.csv(vireo_with_geno_out_path, sep = "\t")
+
+    cell_idxs_no_geno <- match(vireo_no_geno_out$cell, colnames(cells[[s]]))
+    cells[[s]]$sample_vireo_no_geno <- paste0(s, "_", vireo_no_geno_out$donor_id[cell_idxs_no_geno])
+
+    cell_idxs_with_geno <- match(vireo_with_geno_out$cell, colnames(cells[[s]]))
+    cells[[s]]$sample_vireo_with_geno <- paste0(s, "_", vireo_with_geno_out$donor_id[cell_idxs_with_geno])
+
+    tab <- table(cells[[s]]$sample_vireo_no_geno,
+                 cells[[s]]$sample_vireo_with_geno)
+    tab <- tab[, grepl("doublet|unassigned", colnames(tab)) == FALSE]
+    donor0_alias <- names(which.max(tab[rownames(tab) == paste0(s, "_donor0"), ]))
+    donor1_alias <- names(which.max(tab[rownames(tab) == paste0(s, "_donor1"), ]))
+
+    if (donor0_alias == donor1_alias) {
+        warning(paste("s", s, ": donor0_alias == donor1_alias"))
+    }
+
+    cells[[s]]$sample_vireo_no_geno_unaliased <- cells[[s]]$sample_vireo_no_geno
+    cells[[s]]$sample_vireo_no_geno_unaliased[cells[[s]]$sample_vireo_no_geno == paste0(s, "_donor0")] <- donor0_alias
+    cells[[s]]$sample_vireo_no_geno_unaliased[cells[[s]]$sample_vireo_no_geno == paste0(s, "_donor1")] <- donor1_alias
+
+    cellbender_barcodes_path <- paste0("data/", s, "/", s,
+                                       "_cellbender_cell_barcodes.csv")
+    cellbender_barcodes <- read.csv(cellbender_barcodes_path, header = FALSE)$V1
+    cells[[s]] <- cells[[s]][, cellbender_barcodes]
+
+    doublet_or_unassigned <- grepl(pattern = "doublet|unassigned",
+                                   x = cells[[s]]$sample_vireo_no_geno_unaliased)
+    cells[[s]] <- cells[[s]][, doublet_or_unassigned == FALSE]
+    cells[[s]]$sample <- cells[[s]]$sample_vireo_no_geno_unaliased
+}
+
+cells$P1$sample[cells$P1$sample == "P1_PVA"] <- "AdeleInjectedCells"
+cells$P1$sample[cells$P1$sample == "P1_PVC"] <- "DollyRecellSN"
+cells$P2_R$sample[cells$P2_R$sample == "P2_R_Fergie-Graft"] <- "FergieRecellSN"
+cells$P2_R$sample[cells$P2_R$sample == "P2_R_PVC"] <- "DollyInjectedCells"
+cells$P3$sample[cells$P3$sample == "P3_Fergie-Graft"] <- "FergieInjectedCells"
+cells$P3$sample[cells$P3$sample == "P3_PVA"] <- "AdeleRecellSN"
+
+for (s in c("CherInjectedCells", "CherRecellSN")) {
+    file_name <- paste0("data/", s, "/", s, "_cellbender_filtered.h5")
+    mat <- Read10X_h5(file_name)
+    true_barcodes <- colnames(mat)
+
+    dir_name <- paste0("data/", s, "/filtered_feature_bc_matrix")
+    mat <- Read10X(dir_name)
+    mat <- mat[, colnames(mat) %in% true_barcodes]
+
+    cells[[s]] <- CreateSeuratObject(mat)
+
+    cells[[s]]$sample <- s
+}
+
+for (s in names(cells)) {
+    cells[[s]]$lane <- s
+
+    if (s %in% c("CherInjectedCells", "CherRecellSN")) {
+        cells[[s]]$technology <- "one"
+    } else {
+        cells[[s]]$technology <- "two"
+    }
+}
+```
+
+## Merge samples
+
+Merge all SN samples into one Seurat object and filter based on number of genes
+and molecules.
+
+```{r merge_sn_data}
+cells$all_sn <- merge(x = cells$CherInjectedCells,
+                      y = c(cells$CherRecellSN, cells$P1, cells$P2_R,
+                            cells$P3))
+
+VlnPlot(cells$all_sn, c("nFeature_RNA", "nCount_RNA"), pt.size = 0,
+        group.by = "sample")
+
+qc_df <- t(data.frame(c("AdeleInjectedCells", 6500, 20000),
+                      c("AdeleRecellSN", 5000, 15000),
+                      c("CherInjectedCells", 8000, 60000),
+                      c("CherRecellSN", 5000, 20000),
+                      c("DollyInjectedCells", 6500, 35000),
+                      c("DollyRecellSN", 5000, 15000),
+                      c("FergieInjectedCells", 7000, 30000),
+                      c("FergieRecellSN", 5500, 25000))) %>%
+            as.data.frame()
+rownames(qc_df) <- NULL
+colnames(qc_df) <- c("sample", "nFeature_max", "nCount_max")
+qc_df$nFeature_max <- as.numeric(qc_df$nFeature_max)
+qc_df$nCount_max <- as.numeric(qc_df$nCount_max)
+
+sample_idx <- match(cells$all_sn$sample, qc_df$sample)
+pass_qc_idx <- cells$all_sn$nFeature_RNA <= qc_df[sample_idx, "nFeature_max"] &
+               cells$all_sn$nCount_RNA <= qc_df[sample_idx, "nCount_max"]
+cells$all_sn <- cells$all_sn[, pass_qc_idx]
+
+DefaultAssay(cells$all_sn) <- "RNA"
+cells$all_sn <- NormalizeData(cells$all_sn) %>%
+                    FindVariableFeatures() %>%
+                    ScaleData() %>%
+                    RunPCA() %>%
+                    RunHarmony("lane") %>%
+                    RunUMAP(dims = 1:20, reduction = "harmony")
+
+cells$all_sn$before_after <- "Before"
+after_samples <- c("AdeleRecellSN", "CherRecellSN", "DollyRecellSN",
+                   "FergieRecellSN")
+cells$all_sn$before_after[cells$all_sn$sample %in% after_samples] <- "After"
+```
+
+## Find DEGs and DE gene sets (pre- vs post-)
+
+Compute differentially expressed genes between pre- and post-bioreactor nuclei.
+Map these to differentially expressed gene sets.
+
+```{r gsea_sn, eval = compilation_level >= 1}
+hallmark_gene_sets <- msigdbr(species = "Sus scrofa", category = "H") %>%
+                        split(x = .$gene_symbol, f = .$gs_name)
+
+to_label <- c("SEMA3C", "VEGFA", "HIF1A", "P4HA1", "PLAUR", "PTGS2",
+              "THBS1", "TIMP1", "SEMA3D", "NDRG1", "EGFR", "ETS1", "POSTN",
+              "VCAN", "LUM", "TIMP2", "RNH1")
+
+marks_after_before <- FindMarkers(cells$all_sn, group.by = "before_after",
+                                  ident.1 = "After", ident.2 = "Before",
+                                  latent.vars = c("technology", "lane"),
+                                  test.use = "LR")
+marks_after_before$gene <- rownames(marks_after_before)
+marks_after_before <- marks_after_before[order(marks_after_before$avg_log2FC, decreasing = TRUE), ]
+marks_before_after_to_plot <- marks_after_before[abs(marks_after_before$avg_log2FC) > 0.5, ]
+out_spreadsheet <- createWorkbook()
+worksheet_name <- "degs"
+addWorksheet(out_spreadsheet, worksheet_name)
+writeData(out_spreadsheet, worksheet_name, marks_after_before,
+          rowNames = FALSE)
+file_name <- paste0("out_data/after_before_degs_all_sn_lane_covar_LR_test.xlsx")
+saveWorkbook(out_spreadsheet, file_name, overwrite = TRUE)
+file_name <- paste0("out_data/after_before_degs_all_sn_lane_covar_LR_test.csv")
+write.csv(marks_after_before, file = file_name)
+
+marks_before_after_to_plot[marks_before_after_to_plot$gene == "ENSSSCG00000017164", "gene"] <- "TIMP2"
+rownames(marks_before_after_to_plot) <- marks_before_after_to_plot$gene
+p <- VolPlot(marks_before_after_to_plot, to_label)
+print(p)
+ggsave(plot = p,
+       filename = paste0("images/all_sn_after_vs_before_VolPlot_no_shapes.pdf"),
+       width = 10)
+
+out_spreadsheet <- createWorkbook()
+sheet_name <- "gsea"
+addWorksheet(out_spreadsheet, sheet_name)
+marks_after_before$gene <- rownames(marks_after_before)
+
+fgsea_res <- run_fgsea(marks_after_before, hallmark_gene_sets)
+setColWidths(out_spreadsheet, sheet_name, cols = 1:9,
+             widths = c(41, 12, 12, 12, 12, 12, 4, 90, 7))
+
+writeData(out_spreadsheet, sheet_name, as.data.frame(fgsea_res),
+          rowNames = FALSE)
+
+file_name <- paste0("out_data/fgsea_results_all_sn_after_vs_before.xlsx")
+saveWorkbook(out_spreadsheet, file_name, overwrite = TRUE)
+
+fgsea_res$is_signif <- factor(fgsea_res$is_signif,
+                              levels = c(TRUE, FALSE))
+fgsea_res$pathway_pretty <- sapply(fgsea_res$pathway,
+                                   function(x) {
+                                       substr(x, 10, nchar(x))
+                                   })
+to_display <- c("HALLMARK_HYPOXIA", "HALLMARK_GLYCOLYSIS",
+                "HALLMARK_ANGIOGENESIS", "HALLMARK_G2M_CHECKPOINT",
+                "HALLMARK_E2F_TARGETS",
+                "HALLMARK_OXIDATIVE_PHOSPHORYLATION",
+                "HALLMARK_MYC_TARGETS_V1")
+fgsea_res <- subset(fgsea_res, pathway %in% to_display)
+p <- ggplot(fgsea_res, aes(reorder(pathway_pretty, NES), NES)) +
+        geom_point(aes(size = size)) +
+        scale_color_manual(values = c("#1E88E5", "#D81B60")) +
+        coord_flip() +
+        labs(x = "Pathway", y = "Normalized Enrichment Score",
+             title = "Hallmark gene set enrichment analysis",
+             size = "Gene set size") +
+        theme_minimal()
+file_name = paste0("images/hallmarks_gsea_after_before_all_sn_subset.pdf")
+print(p)
+ggsave(plot = p, filename = file_name, height = 7, width = 20,
+       units = "cm", dpi = 300)
+```
+
+## Gene sets in UMAPs
+
+Vizualise expression of sets of genes across the UMAP.
+
+```{r misc_sn_lists}
+sn_samples_ordered <- c("DollyInjectedCells", "FergieInjectedCells",
+                        "AdeleInjectedCells", "CherInjectedCells",
+                        "DollyRecellSN", "FergieRecellSN", "AdeleRecellSN",
+                        "CherRecellSN")
+
+module_genes <- list("Angio/hypoxia" = c("SEMA3C", "VEGFA", "HIF1A", "P4HA1",
+                                         "PLAUR", "PTGS2", "NDRG1", "EGFR",
+                                         "POSTN", "VCAN", "LUM"),
+                     "skeletal muscle" = c("ACTA1", "MEF2A", "MEF2C"),
+                     "smooth muscle" = c("TAGLN", "ACTA2", "CALD1", "CD151",
+                                         "KCNMA1", "MYL6", "MYL9", "MYLK",
+                                         "DES"),
+                     "pericytes" = c("CSPG4", "PDGFRB", "VEGFA", "CCL2",
+                                     "COL4A1", "COL4A2", "LOXL2", "OLFML2A"),
+                     "fibroblasts" = c("PRRX1", "PRRX2", "ZEB1",
+                                       "PCOLCE", "DCN", "LUM", "PDGFRA",
+                                       "S100A4"),
+                     "ecm_remodelling" = c("MMP1", "MMP16", "ADAM23",
+                                           "ADAM10", "ADAM17", "ADAM9",
+                                           "ADAMTS6", "ADAMTS10", "ADAMTS17",
+                                           "ADAMTS3"))
+
+cells$all_sn <- AddModuleScore(cells$all_sn, features = module_genes)
+cluster_col_idxs <- grepl("Cluster", colnames(cells$all_sn@meta.data))
+colnames(cells$all_sn@meta.data)[cluster_col_idxs] <- names(module_genes)
+p <- FeaturePlot(cells$all_sn, names(module_genes), order = TRUE, cols = viridis::plasma(256)) & coord_equal()
+print(p)
+f_name <- paste0("images/all_sn_module_scores.pdf")
+ggsave(plot = p, filename = f_name, height = 20, width = 15)
+```
+
+## Marker gene expression
+
+Make violin plots of marker genes.
+
+```{r sn_marker_genes}
+pathway_genes <- c("SEMA3D", "THBS1", "ENSSSCG00000017164", "RNH1", "NDRG1", "VEGFA", "HIF1A", "PTGS2")
+cells$all_sn$before_after <- factor(cells$all_sn$before_after,
+                                   levels = c("Before", "After"))
+p <- lapply(list(pathway_genes),
+            function(x) {
+                ncol <- length(pathway_genes)
+                pl <- VlnPlot(cells$all_sn, group.by = "before_after",
+                        features = x,
+                        pt.size = 0, combine = FALSE)
+                pl <- lapply(pl, function(y) {y + theme(axis.title = element_blank(),
+                                                        legend.position = "none")})
+                pl <- lapply(pl, function(y) {
+                                 if (y$labels$title == "ENSSSCG00000017164") {
+                                     y$labels$title <- "TIMP2"
+                                 }
+                                 return(y)
+                        })
+                pl <- ggarrange(plotlist = pl, nrow = 1, ncol = ncol)
+                return(pl)
+            })
+p <- ggarrange(plotlist = p, ncol = 1)
+f_name <- paste0("images/pathway_marks_vlnplot_all_sn.pdf")
+print(p)
+ggsave(p, height = 4, width = 15, filename = f_name, limitsize = FALSE)
+```
+
+## Differential abundance analysis
+
+Carry out differential abundance analysis using DA-seq to identify
+transcriptomic regions with an over- or under-abundance of either pre- or
+post-bioreactor nuclei.
+
+```{r diff_abundance_analysis, eval = compilation_level >= 1}
+embs <- Embeddings(object = cells$all_sn, reduction = "harmony")
+labels <- as.character(cells$all_sn$before_after)
+daseq_verdicts <- getDAcells(embs, cell.labels = labels, labels.1 = "Before",
+                             labels.2 = "After")
+
+cells$all_sn$daseq_verdict <- "Non-dominated"
+cells$all_sn$daseq_verdict[daseq_verdicts$da.up] <- "Dominated by Post-"
+cells$all_sn$daseq_verdict[daseq_verdicts$da.down] <- "Dominated by Pre-"
+p1 <- DimPlot(cells$all_sn, group.by = "daseq_verdict",
+              order = c("Non-dominated", "Dominated by Post-", "Dominated by Pre-"),
+              cols = c("#F8766D", "#00BFC4", "blue")) +
+        theme(legend.position = "bottom")
+
+DimPlotOrdered <- function(cell_obj, reduction, dims, group.by) {
+    group_order <- names(sort(table(cell_obj[[group.by]][, 1])))
+    p_ordered <- DimPlot(cell_obj, reduction = reduction, dims = dims,
+                         group.by = group.by, order = group_order)
+
+    return(p_ordered)
+}
+
+p2 <- DimPlotOrdered(cells$all_sn, reduction = "umap", dims = 1:2,
+                     group.by = "before_after") +
+        theme(legend.position = "bottom")
+p <- ggarrange(p2, p1, nrow = 1)
+print(p)
+ggsave(plot = p, filename = "images/all_sn_before_after_daseq_verdicts_umap.pdf",
+       width = 16, height = 8)
+```
+
+## Clustering analysis
+
+First run clustree to determine the "true" number of clusters, then identify
+inter-cluster DEGs.
+
+```{r intercluster_degs_clustree, eval = compilation_level >= 1}
+cells$all_sn <- FindNeighbors(cells$all_sn, dims = 1:20, reduction = "harmony")
+for (res in seq(0.01, 0.4, 0.02)) {
+    message(res)
+    cells$all_sn <- FindClusters(cells$all_sn, resolution = res)
+}
+p <- clustree(cells$all_sn, prefix = "RNA_snn_res.")
+print(p)
+ggsave(plot = p, filename = "images/all_sn_clustree_results.pdf", height = 20)
+```
+
+Visualize the five clusters suggested by clustree and look at the expressions
+of marker genes and the distributions of pre- and post-bioreactor nuclei across
+them.
+
+```{r all_sn_five_clusts}
+# Res identified by clustree
+res <- 0.13
+clusts_name <- paste0("RNA_snn_res.", res)
+cells$all_sn$seurat_clusters <- cells$all_sn[[clusts_name]]
+Idents(cells$all_sn) <- "seurat_clusters"
+
+p <- DimPlot(cells$all_sn, group.by = "seurat_clusters", pt.size = -0.3)
+print(p)
+ggsave(paste0("images/DimPlot_all_sn_5_clusts.pdf"), p)
+
+
+md_mat <- t(as.matrix(cells$all_sn@meta.data[, names(module_genes)]))
+md_assay <- CreateAssayObject(data = md_mat, key = "MD_")
+cells$all_sn[["MetaData"]] <- md_assay
+
+p <- DotPlot(cells$all_sn, names(module_genes), assay ="MetaData") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        scale_color_viridis()
+print(p)
+ggsave("images/all_sn_5_clusts_dot_plot_modules.pdf", p, width=7, height=5)
+
+df <- cells$all_sn@meta.data[, c("before_after", "RNA_snn_res.0.13")]
+levels(df$before_after) <- c("Pre-bioreactor", "Post-bioreactor")
+df$before_after <- factor(df$before_after,
+                          levels = c("Post-bioreactor", "Pre-bioreactor"))
+p <- ggplot(df, aes(x=RNA_snn_res.0.13, fill=before_after)) +
+        geom_bar(position="fill") +
+        scale_fill_manual(values = c("Pre-bioreactor"="#F8766D",
+                                     "Post-bioreactor"="#00BFC4")) +
+        xlab("Clusters") +
+        ylab("Counts") +
+        theme_minimal() +
+        theme(legend.position = "top", legend.title = element_blank(),
+              legend.direction = "vertical")
+print(p)
+ggsave("images/pre_post_by_cluster_barplot.pdf", p, height = 4, width = 2.5)
+```
+
+Carry out subclustering on each of the five clusters. Again look at the
+expression of sets of marker genes across each subcluster.
+
+```{r all_sn_further_subclust}
+cells$all_sn$before_after <- factor(cells$all_sn$before_after,
+                                    levels = c("Before", "After"))
+
+cells_subs <- list()
+for (clust in levels(cells$all_sn$seurat_clusters)) {
+    message(paste("Sub-clustering cluster", clust))
+    cells_sub <- subset(cells$all_sn, seurat_clusters == clust)
+
+    cells_sub <- NormalizeData(cells_sub) %>%
+                    FindVariableFeatures() %>%
+                    ScaleData() %>%
+                    RunPCA() %>%
+                    RunHarmony("lane") %>%
+                    RunUMAP(dims = 1:20, reduction = "harmony") %>%
+                    FindNeighbors(dims = 1:20, reduction = "harmony")
+
+    for (res in seq(0.01, 0.4, 0.02)) {
+        message(res)
+        cells_sub <- FindClusters(cells_sub, resolution = res)
+    }
+    cells_subs[[paste0("clust_", clust)]] <- cells_sub
+    p <- clustree(cells_sub, prefix = "RNA_snn_res.")
+    print(p)
+    ggsave(plot = p,
+           filename = paste0("images/all_sn_clust", clust, "clustree.pdf"),
+           height = 20)
+}
+
+clustree_verdicts <- list("clust_0" = 0.13, "clust_1" = 0.03, "clust_2" = 0.11,
+                          "clust_3" = 0.07, "clust_4" = 0.03)
+for (clust in names(clustree_verdicts)) {
+    pt_size <- -0.3
+    res_name <- paste0("RNA_snn_res.", clustree_verdicts[[clust]])
+    Idents(cells_subs[[clust]]) <- res_name
+    cells_subs[[clust]]$seurat_clusters <- Idents(cells_subs[[clust]])
+
+    before_after_dp <- DimPlot(cells_subs[[clust]], group.by = "before_after",
+                               pt.size = pt_size,
+                               order = c("After", "Before")) +
+                        theme_void()
+    clusts_dp <- DimPlot(cells_subs[[clust]], group.by = "seurat_clusters", pt.size = pt_size) + theme_void()
+
+    cells_subs[[clust]] <- AddModuleScore(cells_subs[[clust]],
+                                          features = module_genes)
+    cluster_col_idxs <- grepl("Cluster",
+                              colnames(cells_subs[[clust]]@meta.data))
+    colnames(cells_subs[[clust]]@meta.data)[cluster_col_idxs] <- names(module_genes)
+
+    top_row <- ggarrange(before_after_dp, clusts_dp)
+
+    dot_plot <- DotPlot(cells_subs[[clust]], features = names(module_genes)) +
+                    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                          axis.title = element_blank()) +
+                    scale_color_viridis()
+
+    p_title <- ggplot() +
+                annotate("text", x = 0, y = 0, size = 6, label = clust) +
+                theme_void()
+    p <- ggarrange(p_title, top_row, dot_plot, ncol = 1,
+                   heights = c(0.03, 0.5, 0.3))
+
+    print(p)
+    ggsave(paste0("images/all_sn_clust_", clust, "_all_plots.pdf"), p, height=10, width=10)
+}
+```
+
+```{r clustree_to_use}
+# Clustree also says to use 0.29
+clustree_to_use <- "RNA_snn_res.0.29"
+Idents(cells$all_sn) <- cells$all_sn[[clustree_to_use]][, 1]
+```
+
+Plot heatmaps of DEGs in pre- and post-bioreactor nuclei.
+
+```{r pretty_heatmaps}
+marks_dfs_list <- list("before_after" = list(), clustree_to_use = list())
+marks <- custom_FindMarkers(cells$all_sn, grouping_col = "sample",
+                            md_colnames = names(module_genes),
+                            grep(x = sn_samples_ordered, pattern = "Recell",
+                                 value = TRUE),
+                            grep(x = sn_samples_ordered, pattern = "Injected",
+                                 value = TRUE),
+                            latent_vars = c("lane", "technology"))
+marks_dfs_list$before_after$marker_sets <- marks
+
+if (compilation_level >= 1) {
+    marks_dfs_list$before_after$marker_sets_genes <- marks_after_before
+    marks_dfs_list$before_after$marker_genes <- marks_after_before
+} else {
+    # If DEGs haven't been computed this time, then load them from file
+    marks_dfs_list$before_after$marker_sets_genes <- read.csv("out_data/after_before_degs_all_sn_lane_covar_LR_test.csv")
+    marks_dfs_list$before_after$marker_genes <- read.csv("out_data/after_before_degs_all_sn_lane_covar_LR_test.csv")
+}
+
+de_modules_list <- list()
+for (clust in levels(cells$all_sn[[clustree_to_use]][, 1])) {
+    message(clust)
+    marks <- custom_FindMarkers(cells$all_sn, grouping_col = clustree_to_use,
+                                md_colnames = names(module_genes),
+                                clust,
+                                setdiff(levels(cells$all_sn[[clustree_to_use]][, 1]), clust),
+                                latent_vars = c("lane", "technology"))
+    marks$cluster <- clust
+    de_modules_list[[clust]] <- marks
+}
+de_modules_list <- do.call(rbind, de_modules_list)
+
+p <- DotPlot(cells$all_sn, features = unique(unlist(c(module_genes))),
+             group.by = "before_after", scale = TRUE,
+             cols = c("lightgrey", "#FF2600")) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+dot_plot_df <- p[[1]]
+md <- "marker_sets_genes"
+marks_sub_pval <- subset(marks_dfs_list[["before_after"]][[md]], p_val_adj <= 0.05)
+
+# If FindMarkers has been run (instead of FindAllMarkers), add
+# placeholder cluster information as a new column in the df (as
+# this is assumed to exist by the plotting code)
+if (is.null(marks_sub_pval$cluster)) {
+    tmp_list <- list()
+    for (clust in unique(cells$all_sn[["before_after"]][, 1])) {
+        tmp_list[[clust]] <- marks_sub_pval
+        tmp_list[[clust]]$cluster <- clust
+    }
+    marks_sub_pval <- do.call(rbind, tmp_list)
+}
+
+sig_degs_df <- data.frame(id = marks_sub_pval$cluster,
+                          features.plot = marks_sub_pval$gene)
+
+dot_plot_df$features.plot <- recode(dot_plot_df$features.plot, ENSSSCG00000017164 = "TIMP2")
+sig_degs_df$features.plot <- recode(sig_degs_df$features.plot, ENSSSCG00000017164 = "TIMP2")
+
+dot_plot_df$lfc <- NA
+for (g in unique(dot_plot_df$features.plot)) {
+    df_sub <- subset(dot_plot_df, features.plot == g)
+    for (i in unique(df_sub$id)) {
+        in_expr <- df_sub[df_sub$id == i, "avg.exp"]
+        out_expr <- mean(df_sub[df_sub$id != i, "avg.exp"])
+        min_val <- min(in_expr, out_expr)
+        if (min_val < 0) {
+            # If we have negative "expression" (probably not from
+            # genes, but rather from module scores), then shift so
+            # that the minimum is 1 to avoid taking logs of
+            # negative values
+            in_expr <- in_expr - min_val + 1
+            out_expr <- out_expr - min_val + 1
+        }
+        dot_plot_df[(dot_plot_df$id == i) & (dot_plot_df$features.plot == g), "lfc"] <- log2(in_expr / out_expr)
+    }
+}
+
+for (gene_module in names(module_genes)) {
+    genes_to_plot <- module_genes[[gene_module]]
+    df_sub <- subset(dot_plot_df, features.plot %in% genes_to_plot)
+    p <- DotPlot_square(df_sub, sig_degs_df)
+    gene_module_safe <- gsub(x = gene_module,
+                             pattern = "[/, ]",
+                             replacement = "_")
+    file_name <- paste0("images/heatmap_plus_dots_all_sn_before_after_", md, "_module_",
+                        gene_module_safe, ".pdf")
+    print(p)
+    ggsave(plot = p, filename = file_name,
+           height = 0.5 + (0.2 * nrow(df_sub)),
+           width = 3.8)
+}
+```
+
+# Spatial transcriptomic data
+
+Load the ST data.
+
+```{r load_st_data}
+new_st_samples <- c("Cher_Graft_V", "Cher_native_V", "Cher_ReCell_V",
+                "Fergie_Graft_V", "PVA", "PVB", "PVC", "PVD")
+st_samples_orig_names <- new_st_samples
+old_st_samples <- c("Native_1_ST", "Native_2_ST", "Native_3_ST")
+st_samples <- c(old_st_samples, new_st_samples)
+for (s in st_samples) {
+    dir_name <- paste0("data/", s, "/outs")
+    cells[[s]] <- Load10X_Spatial(data.dir = dir_name)
+    cells[[s]] <- add_visual_reduction(cells[[s]])
+    cells[[s]][["x"]] <- Embeddings(cells[[s]], "visual")[, 2]
+    cells[[s]][["y"]] <- Embeddings(cells[[s]], "visual")[, 1]
+    cells[[s]] <- SCTransform(cells[[s]], assay = "Spatial")
+    cells[[s]]$entropy <- apply(GetAssayData(cells[[s]]), 2, entropy.empirical)
+}
+
+exclusion_csv_dir <- "data/exclusion_csvs"
+for (f_name in dir(exclusion_csv_dir)) {
+    s <- strsplit(f_name, "\\.")[[1]][1]
+    f_path <- paste0(exclusion_csv_dir, "/", f_name)
+    excluded_barcodes <- read.csv(f_path)$Barcode
+    cells[[s]] <- cells[[s]][, !colnames(cells[[s]]) %in% excluded_barcodes]
+}
+
+new_samples_renames <- list("PVA" = "Adele_Graft_V", "PVB" = "Beyonce_Graft_V",
+                            "PVC" = "Dolly_Graft_V", "PVD" = "Ella_Graft_V")
+names(cells) <- sapply(names(cells),
+                       function(y) {
+                           if (y %in% names(new_samples_renames)) {
+                               new_samples_renames[[y]]
+                           } else {
+                               y
+                           }})
+new_st_samples <- sapply(new_st_samples,
+                       function(y) {
+                           if (y %in% names(new_samples_renames)) {
+                               new_samples_renames[[y]]
+                           } else {
+                               y
+                           }})
+st_samples <- c(old_st_samples, new_st_samples)
+```
+
+## Cell type classification
+
+Merge the ST data, then cluster it to identify cell types.
+
+```{r class_using_merged_st}
+rename_sample_list <- list("Native_1_ST" = "Native DP1",
+                           "Native_2_ST" = "Native DP2",
+                           "Native_3_ST" = "Native DP3",
+                           "Cher_native_V" = "Native (C)",
+                           "Fergie_Graft_V" = "3 months (F)",
+                           "Cher_Graft_V" = "6 months (C)",
+                           "Cher_ReCell_V" = "Pre-implant",
+                           "Adele_Graft_V" = "6 months (A)",
+                           "Beyonce_Graft_V" = "6 months (B)",
+                           "Dolly_Graft_V" = "1 month (D)",
+                           "Ella_Graft_V" = "3 months (E)")
+# For reverse searching:
+rename_sample_list_rev <- setNames(names(rename_sample_list),
+                                   rename_sample_list)
+for (s in names(rename_sample_list)) {
+    cells[[s]][["sample"]] <- rename_sample_list[[s]]
+    names(cells[[s]]@images)[1] <- rename_sample_list[[s]]
+}
+
+set.seed(123)
+cells$merged_all_st <- merge(x = cells[st_samples[1]][[1]],
+                             y = cells[st_samples[-1]],
+                             add.cell.ids = st_samples)
+
+cells$merged_all_st <- SCTransform(cells$merged_all_st, assay = "Spatial") %>%
+                        RunPCA() %>%
+                        RunHarmony("sample", assay.use = "SCT") %>%
+                        RunUMAP(reduction = "harmony", dims = 1:20)
+
+cells$merged_all_st <- FindNeighbors(cells$merged_all_st,
+                                     reduction = "harmony",
+                                     dims = 1:20) %>%
+                        FindClusters(resolution = 0.08)
+
+cells$merged_all_st$merged_cell_type <- "Unknown"
+cells$merged_all_st$merged_cell_type[which(cells$merged_all_st$seurat_clusters == "0")] <- "Fibroblast"
+cells$merged_all_st$merged_cell_type[which(cells$merged_all_st$seurat_clusters == "1")] <- "Skeletal muscle"
+cells$merged_all_st$merged_cell_type[which(cells$merged_all_st$seurat_clusters == "2")] <- "Epithelial"
+cells$merged_all_st$merged_cell_type[which(cells$merged_all_st$seurat_clusters == "3")] <- "Smooth muscle"
+cells$merged_all_st$merged_cell_type[which(cells$merged_all_st$seurat_clusters == "4")] <- "Pericyte"
+cells$merged_all_st$merged_cell_type[which(cells$merged_all_st$seurat_clusters == "5")] <- "NA"
+cells$merged_all_st$merged_cell_type[which(cells$merged_all_st$seurat_clusters == "6")] <- "Neural"
+
+cells$merged_all_st$merged_cell_type <- factor(cells$merged_all_st$merged_cell_type,
+                                        levels = c("Skeletal muscle",
+                                                   "Fibroblast", "Epithelial",
+                                                   "Smooth muscle",
+                                                   "Pericyte", "Neural",
+                                                   "NA"))
+Idents(cells$merged_all_st) <- cells$merged_all_st$merged_cell_type
+
+cells$merged_all_st$sample <- factor(cells$merged_all_st$sample,
+                              levels = c("Pre-implant", "1 month (D)",
+                                         "3 months (E)", "3 months (F)",
+                                         "6 months (A)", "6 months (B)",
+                                         "6 months (C)", "Native (C)",
+                                         "Native DP1", "Native DP2",
+                                         "Native DP3"))
+
+clust_cols <- c("#CC79A7", "#D55E00", "#0072B2", "#F0E442", "#009E73",
+                "#56B4E9", "#E69F00", "#000000")
+
+cells$merged_all_st$pooled_sample <- as.character(cells$merged_all_st$sample)
+cells$merged_all_st$pooled_sample[grepl(x = cells$merged_all_st$sample, pattern = "3 months")] <- "3 months (E,F)"
+cells$merged_all_st$pooled_sample[grepl(x = cells$merged_all_st$sample, pattern = "6 months")] <- "6 months (A,B,C)"
+cells$merged_all_st$pooled_sample[grepl(x = cells$merged_all_st$sample, pattern = "Native")] <- "Native"
+
+cells$merged_all_st$pooled_sample <- factor(cells$merged_all_st$pooled_sample, levels = c("Pre-implant", "1 month (D)", "3 months (E,F)", "6 months (A,B,C)", "Native"))
+
+pool_colors <- list("Pre-implant" = "#56B4E9", "1 month (D)" = "#F0E442",
+                    "3 months (E,F)" = "#E6AE42",
+                    "6 months (A,B,C)" = "#D55E00", "Native" = "#009E73")
+
+umap_theme <- theme_void() + theme(plot.title = element_blank(),
+                                   legend.position = "bottom")
+umap_by_sample <- DimPlot(cells$merged_all_st, group.by = "sample") + umap_theme
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+default_colors <- c("#D4C82A", gg_color_hue(4))
+names(default_colors) <- levels(cells$merged_all_st$pooled_sample)
+umap_by_sample_default_colors <- DimPlot(cells$merged_all_st,
+                                         group.by = "pooled_sample",
+                                         cols = default_colors,
+                                         order = names(pool_colors)) +
+                                    umap_theme
+
+umap_by_pool <- DimPlot(cells$merged_all_st, group.by = "pooled_sample",
+                        cols = default_colors, order = rev(names(pool_colors))) +
+                    umap_theme
+umap_by_ct <- DimPlot(cells$merged_all_st, group.by = "merged_cell_type",
+                      cols = clust_cols) +
+                    umap_theme
+
+p <- ggarrange(umap_by_pool,
+               ggplot() + theme_void(),
+               umap_by_ct,
+               nrow = 1, widths = c(0.45, 0.1, 0.45))
+print(p)
+ggsave(p, filename = "images/sample_celltype_umaps.pdf", units = "cm",
+       height = 15, width = 30, dpi = 300)
+
+for (s in unique(names(rename_sample_list))) {
+    sample_idxs <- which(cells$merged_all_st$sample == rename_sample_list[[s]])
+    clusts <- cells$merged_all_st$merged_cell_type[sample_idxs]
+    names(clusts) <- NULL
+    cells[[s]]$merged_cell_type <- clusts
+}
+
+samples_ordered <- rename_sample_list_rev[levels(cells$merged_all_st$sample)]
+to_plot <- c("Cher_ReCell_V", "Dolly_Graft_V", "Fergie_Graft_V",
+             "Cher_Graft_V", "Cher_native_V")
+plot_list <- lapply(samples_ordered[samples_ordered %in% to_plot],
+                    function(s) {
+                        p <- SpatialDimPlot(cells[[s]],
+                                       group.by = "merged_cell_type",
+                                       stroke = 0) +
+                            scale_fill_manual(values = clust_cols,
+                                              drop = FALSE) +
+                            ggtitle(rename_sample_list[[s]]) +
+                            theme (plot.title = element_text(hjust = 0.5))
+                        FixSpatialPlot(p)
+                    })
+
+p <- ggarrange(plotlist = plot_list, common.legend = TRUE, legend = "bottom",
+               ncol = length(to_plot), nrow = 1)
+print(p)
+ggsave(p, filename="images/merged_st_clustered_cell_types_overlay.pdf",
+       units = "cm", width = 30, height = 10, dpi = 300)
+```
+
+Plot proportion of cell types in each sample.
+
+```{r cluster_bar_charts}
+p <- ggplot(cells$merged_all_st@meta.data,
+            aes(x = pooled_sample, fill = merged_cell_type)) +
+    geom_bar(position = "fill") +
+    ylab("Proportion of spots") +
+    labs(fill = "Cell type") +
+    scale_fill_manual(values = clust_cols) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 55, hjust = 1, size = 14),
+          axis.text.y = element_text(size = 14),
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(size = 14),
+          legend.text = element_text(size = 14),
+          legend.title = element_text(size = 14, hjust = 0.5))
+print(p)
+file_name <- paste0("images/merged_st_clustered_cell_types_bar_chart_by_pooled_sample.pdf")
+ggsave(p, filename = file_name, units = "cm", width = 15, height = 15,
+       dpi = 300)
+
+df_to_plot <- cells$merged_all_st@meta.data
+df_to_plot$merged_cell_type <- as.character(df_to_plot$merged_cell_type)
+df_to_plot$merged_cell_type <- factor(df_to_plot$merged_cell_type, levels = c("Pericyte", "Fibroblast", "Epithelial", "Smooth muscle", "Skeletal muscle", "Neural", "NA"))
+p <- ggplot(df_to_plot,
+            aes(fill = pooled_sample, x = merged_cell_type)) +
+        scale_fill_manual(values = default_colors) +
+        geom_bar(position = "fill") +
+        ylab("Proportion of spots") +
+        labs(fill = "Sample") +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 55, hjust = 1, size = 14),
+              axis.text.y = element_text(size = 14),
+              axis.title.x = element_blank(),
+              axis.title.y = element_text(size = 14),
+              legend.text = element_text(size = 14),
+              legend.title = element_text(size = 14, hjust = 0.5))
+print(p)
+file_name <- paste0("images/merged_st_sample_by_cluster_bar_chart_by_pooled_sample.pdf")
+ggsave(p, filename = file_name, units = "cm", width = 15, height = 15,
+       dpi = 300)
+```
+
+## Marker genes plots
+
+Plot expression of marker genes across ST samples.
+
+```{r markers_across_samples}
+names(cells$merged_all_st@images) <- c("Native DP1", "Native DP2",
+                                       "Native DP3", "6 months (C)",
+                                       "Native (C)", "Pre-implant",
+                                       "3 months (F)", "6 months (A)",
+                                       "6 months (B)", "1 month (D)",
+                                       "3 months (E)")
+
+st_genes <- c("KRT4", "CSTB", "DES", "MYH11", "MYH3", "MYH7", "KRT5", "IVL",
+              "TAGLN", "CSRP1", "CALD1", "SMTN", "MYH8", "ACTC1", "TNNC1",
+              "TNNC2")
+samples_for_norm_marks <- c("1 month (D)", "3 months (F)", "6 months (C)",
+                            "Native (C)")
+st_sub <- subset(cells$merged_all_st, sample %in% samples_for_norm_marks)
+st_sub@images <- st_sub@images[samples_for_norm_marks]
+plot_list <- lapply(st_genes,
+                    function(gene_name) {
+                        pl <- SpatialFeaturePlot(st_sub, gene_name, stroke = NA, combine = FALSE) %>%
+                                change_color_scale(gene_name) %>%
+                                lapply(FixSpatialPlot)
+                        p <- ggarrange(plotlist = pl, nrow = 1, ncol = 4,
+                                       common.legend = TRUE, legend = "bottom")
+
+                        return(p)
+                    })
+pdf(paste0("images/st_norm_markers.pdf"))
+invisible(lapply(plot_list, print))
+dev.off()
+rm(st_sub)
+gc()
+```
+
+## DotPlots of marker genes
+
+Quantify expression of marker genes across clusters.
+
+```{r marker_genes_dotplot}
+marker_genes <- list("Fibroblast" = c("COL1A1", "COL1A2", "APOE", "CD74",
+                                      "COL3A1", "SPARC", "AEBP1", "CD248",
+                                      "MMP2", "COL6A1", "APOA1", "DCN", "ISLR",
+                                      "LUM", "PCOLCE", "PDGFRA", "BCOLCE"),
+                     "Skeletal muscle" = c("ACTA1", "MYL11", "TNNT3", "TNNC2",
+                                           "TNNI2", "TNNC1", "TNNI1", "MYH7",
+                                           "MYL2", "TNNT1", "MYH3", "MYH8",
+                                           "CKM", "ACTC1", "MEF2A", "MEF2C",
+                                           "MRF4", "MYF5", "MYOD1", "MYOG",
+                                           "MYL6B"),
+                     "Epithelial" = c("SPRP", "CSTB", "KRT4", "S100A2",
+                                      "S100A8", "KRT78", "CNFN", "SBSN",
+                                      "S100A14", "SFN", "KRT5", "CRNN", "DSP",
+                                      "LORICRIN", "IVL", "AQP3", "CLDN4",
+                                      "TP63", "KLF4", "KLF5", "KRT13", "FLG",
+                                      "SOX2", "SOX9", "CDH26", "POSTN", "ANO1",
+                                      "CCL26", "CXCL8", "IL6", "AREG", "EREG",
+                                      "CAPN14", "KRT6", "SERPINB3", "CDH1"),
+                     "Smooth muscle" = c("ACTG2", "MYL9", "MYH11", "CNN1",
+                                         "TAGLN", "DES", "MYL6", "ACTA2",
+                                         "SMTN", "CALD1", "MYLK", "FLNA",
+                                         "CSRP1", "DSTN", "FLNC"),
+                     "Pericyte" = c("MCAM", "RGS5", "CSGP4", "PDGFRB",
+                                    "NOTCH3", "F3", "ANGPT1", "ANGPT2", "DLK1",
+                                    "VEGFA", "FTL", "VIM", "CLU", "HMOX1",
+                                    "NDRG1", "TSPO", "CCL2", "FN1", "NDUFA4L2",
+                                    "IGFBP3", "ECM1", "NUPR1", "LOXL2",
+                                    "PTGES", "SPON2", "CAPG"),
+                     "NA" = c("PTPRC", "CD4", "CD8", "CD80", "CD86",
+                                  "CEACAM8", "CCR4", "CD38", "CD27", "CD69"),
+                     "Neural" = c("TUBA1A", "TUBB3", "TUBB2A", "STMN2",
+                                  "TUBB2B", "MLLT11", "UCHL1", "CARTPT",
+                                  "GFAP", "ELAV1", "ELAV4", "PLP1", "S100B",
+                                  "S100A4"))
+
+marker_genes_no_names <- unlist(marker_genes)
+names(marker_genes_no_names) <- NULL
+p <- DotPlot(cells$merged_all_st, group.by = "seurat_clusters",
+             features = rev(marker_genes_no_names)) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        coord_flip()
+print(p)
+ggsave(plot = p, filename = "images/inter_cluster_degs_dotplot.pdf",
+       height = 40, width = 10)
+
+vln_plots_genes <- list("Epithelial" = c("KRT5", "IVL", "KRT4", "CSTB"),
+                        "Smooth muscle" = c("TAGLN", "CSRP1", "DES", "SMTN", "CALD1", "MYH11"),
+                        "Skeletal muscle" = c("MYH3", "MYH8", "ACTC1", "MYH7", "TNNC1", "TNNC2"))
+
+for (ct in names(vln_plots_genes)) {
+    cells_sub <- subset(cells$merged_all_st, merged_cell_type == ct)
+    cells_sub <- SCTransform(cells_sub, assay = "Spatial")
+    ad <- GetAssayData(cells_sub[vln_plots_genes[[ct]], ])
+    marks_to_plot <- rownames(ad)[is.nan(rowSums(ad)) == FALSE]
+    plot_list <- VlnPlot(cells_sub, group.by = "pooled_sample",
+                 marks_to_plot, pt.size = 0, combine = FALSE,
+                 cols = default_colors)
+    plot_list <- lapply(plot_list,
+                        function(x) {x + theme(axis.title = element_blank())})
+    p <- ggarrange(plotlist = plot_list, nrow = 1)
+    print(p)
+    ggsave(p, filename = paste0("images/vln_plots_", ct, "_extended.pdf"),
+           units = "cm", height = 10, width = 10 * length(plot_list),
+           dpi = 300, limitsize = FALSE)
+}
+```
+
+## Similarity quantification
+
+Quantify spatial similarity between ST samples.
+
+```{r spot_neighborhood_relations}
+# Loading these libraries since otherwise they alter earlier results
+library(reshape2)
+library(circlize)
+library(ggplotify)
+
+plot_list <- list()
+connections_df_list <- list()
+for (s in samples_ordered) {
+    dists <- as.matrix(dist(cells[[s]]@reductions$visual@cell.embeddings))
+    imm_nbors_list <- lapply(1:ncol(cells[[s]]),
+                             function(x) {
+                                 imm_nbors_idxs <- dists[x, ] < 7.5 & dists[x, ] > 0
+                                 imm_nbors_tab <- table(cells[[s]]$merged_cell_type[imm_nbors_idxs])
+                                 imm_nbors_tab <- as.numeric(imm_nbors_tab)
+
+                                 return(imm_nbors_tab)
+                             })
+    imm_nbors_df <- do.call(rbind, imm_nbors_list)
+    imm_nbors_df <- cbind(imm_nbors_df,
+                          data.frame(cluster = cells[[s]]$merged_cell_type))
+    imm_nbors_df$cluster <- factor(imm_nbors_df$cluster,
+                                   levels = levels(cells$merged_all_st$merged_cell_type))
+
+    connections_list <- lapply(levels(imm_nbors_df$cluster),
+                               function(clus) {
+                                   cluster_sub <- subset(imm_nbors_df, cluster == clus) 
+                                   if (nrow(cluster_sub) == 0) {
+                                       cs <- rep(0, length(levels(imm_nbors_df$cluster)))
+                                   } else {
+                                       cs <- colSums(cluster_sub[-which(colnames(cluster_sub) == "cluster")])
+                                   }
+                                   names(cs) <- levels(imm_nbors_df$cluster)
+                                   # return(cs / sum(cs[-which(names(cs) == "cluster")]))
+                                   return(cs)
+                               })
+    names(connections_list) <- levels(imm_nbors_df$cluster)
+
+    connections_mat_list <- lapply(names(connections_list),
+                                   function(x) {
+                                       mat <- as.matrix(connections_list[[x]])
+                                       cbind(rownames(mat), mat, x)
+                                   })
+    connections_mat <- do.call(rbind, connections_mat_list)
+    colnames(connections_mat) <- c("to", "num_links", "from")
+    connections_df <- as.data.frame(connections_mat)
+    connections_df$num_links <- as.numeric(connections_df$num_links)
+    connections_df$from <- factor(connections_df$from,
+                                  levels = levels(cells$merged_all_st$merged_cell_type))
+    connections_df$to <- factor(connections_df$to,
+                                  levels = levels(cells$merged_all_st$merged_cell_type))
+    connections_df_list[[s]] <- connections_df
+}
+
+connections_df_list_pooled <- list()
+for (ps in levels(cells$merged_all_st$pooled_sample)) {
+    samples_in_pool <- unique(subset(cells$merged_all_st, pooled_sample == ps)$sample)
+    if (ps == "Pre-implant") {
+        samples_idxs <- names(connections_df_list) == "Cher_ReCell_V"
+    } else if (ps == "1 month (D)") {
+        samples_idxs <- names(connections_df_list) == "Dolly_Graft_V"
+    } else if (ps == "3 months (E,F)") {
+        samples_idxs <- names(connections_df_list) %in% c("Ella_Graft_V", "Fergie_Graft_V")
+    } else if (ps == "6 months (A,B,C)") {
+        # samples_idxs <- names(connections_df_list) %in% c("Adele_Graft_V", "Beyonce_Graft_V", "Cher_Graft_V")
+        samples_idxs <- names(connections_df_list) %in% c("Beyonce_Graft_V", "Cher_Graft_V")
+    } else if (ps == "Native") {
+        samples_idxs <- names(connections_df_list) %in% c("Cher_native_V", "Native_1_ST", "Native_2_ST", "Native_3_ST")
+    }
+    res <- Reduce("+", lapply(connections_df_list[samples_idxs],
+                              function(x) {x$num_links}))
+    connections_df_list_pooled[[ps]] <- data.frame(from = connections_df_list[[1]]$from,
+                                                   to = connections_df_list[[1]]$to,
+                                                   num_links = res)
+}
+
+# I've temp renamed connections_df_list_pooled to connections_df_list
+connections_df_list <- connections_df_list_pooled
+
+samples_connections_dims_list <- lapply(connections_df_list, function(x) {x$num_links})
+samples_connections_dims <- do.call(rbind, samples_connections_dims_list)
+
+samples_connections_dims <- t(apply(samples_connections_dims, 1, function(x) {x / sum(x)}))
+
+samples_connections_dists <- as.matrix(dist(samples_connections_dims))
+samples_connections_dists <- max(samples_connections_dists) - samples_connections_dists
+samples_connections_dists <- round(samples_connections_dists / max(samples_connections_dists), 2)
+samples_connections_dists[upper.tri(samples_connections_dists)] <- NA
+melted_samples_connections_dists <- melt(samples_connections_dists, na.rm = TRUE)
+colnames(melted_samples_connections_dists)[3] <- "Similarity"
+melted_samples_connections_dists$lt_0_1 <- melted_samples_connections_dists$Similarity < 0.1
+
+p <- ggplot(data = melted_samples_connections_dists,
+            aes(x = Var1, y = Var2, fill = Similarity)) +
+    geom_tile() +
+    scale_x_discrete(labels = levels(cells$merged_all_st$pooled_sample)) +
+    scale_y_discrete(labels = levels(cells$merged_all_st$pooled_sample)) +
+    geom_text(aes(Var1, Var2, label = sprintf("%0.2f", Similarity),
+                  color = lt_0_1),
+              size = 7, fontface = "bold", show.legend = FALSE) +
+    scale_colour_manual(values=c("black", "white")) +
+    scale_fill_gradientn(colors = viridis::inferno(100)) +
+    theme_minimal() +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.text = element_text(size = 16, face = "bold"),
+          legend.text = element_text(size = 16, face = "bold"),
+          legend.title = element_text(size = 16, face = "bold"))
+
+print(p)
+ggsave(plot = p, filename = "images/spatial_connections_similarity_heatmap.pdf",
+       units = "cm", height = 15, width = 18, dpi = 300)
+```
+
+```{r chord_diagrams}
+clust_cols_named <- clust_cols
+names(clust_cols_named) <- levels(cells$merged_all_st$merged_cell_type)
+
+pdf(file = "images/st_samples_connections_chord_diagrams.pdf", width = 12,
+    height = 2)
+par(mfrow = c(1, (length(names(connections_df_list)) + 1)))
+for (df_name in names(connections_df_list)) {
+    df <- connections_df_list[[df_name]]
+    mat <- t(matrix(df$num_links, ncol = 7, nrow = 7))
+    colnames(mat) <- levels(cells$merged_all_st$merged_cell_type)
+    rownames(mat) <- levels(cells$merged_all_st$merged_cell_type)
+    chordDiagram(mat, annotationTrack =  c("grid"),
+                 grid.col = clust_cols_named,
+                 symmetric = TRUE,
+                 keep.diagonal = TRUE, directional = -1,
+                 diffHeight = mm_h(0),
+                 annotationTrackHeight = mm_h(1))
+    title(df_name, font.main = 1)
+}
+dev.off()
+```
+
+# Session info
+
+<details>
+<summary>Click to reveal details of R session</summary>
+```{r session_info}
+sessionInfo()
+```
+
+<!-- https://stackoverflow.com/a/36777618 -->
+```{r package_versions, results = "markup"}
+installed.packages()[names(sessionInfo()$otherPkgs), "Version"]
+```
+
+<!-- Stop large blank section at end of report (https://stackoverflow.com/a/57381047) -->
+<div class="tocify-extend-page" data-unique="tocify-extend-page" style="height: 0;"></div>
+</details>
