@@ -338,7 +338,7 @@ run_fgsea <- function(in_marks, gene_sets)  {
     return(fgsea_res)
 }
 ```
-<details>
+</details>
 
 
 ## Load libraries
